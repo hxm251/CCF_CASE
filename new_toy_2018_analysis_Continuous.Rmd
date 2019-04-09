@@ -1,0 +1,1431 @@
+---
+title: "Toy2 Worked Analysis"
+author: "Hasina Momotaz"
+date: 'Version: `r Sys.Date()`'
+output:
+  html_document:
+      code_folding: show
+      toc: TRUE
+      toc_float: TRUE
+      number_sections: TRUE
+---
+
+## Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(comment = NA,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r packages}
+library(skimr)
+library(tableone)
+library(broom)
+library(Epi)
+library(survival)
+library(Matching)
+library(cobalt)
+library(lme4)
+library(twang)
+library(survey)
+library(rbounds)
+library(tidyverse)
+
+skim_with(numeric = list(hist = NULL), 
+          integer = list(hist = NULL))  
+
+decim <- function(x, k) format(round(x, k), nsmall=k)
+```
+
+
+## The Data Set
+
+The Data Set is 100% fictional, and is available as `toy2.csv` on the course website. 
+
+- It contains data on 400 subjects (140 treated and 260 controls) on treatment status, six covariates, and three outcomes, with no missing observations anywhere. 
+- We assume that a logical argument suggests that the square of `covA`, as well as the interactions of `covB` with `covC` and with `covD` should be related to treatment assignment, and thus should be included in our propensity model.
+- Our objective is to estimate the average causal effect of treatment (as compared to control) on each of the three outcomes, without propensity adjustment, and then with propensity matching, subclassification, weighting and regression adjustment using the propensity score.
+
+```{r load_toy2}
+toy <- read.csv("C:/Users/Hasina Momotaz/Desktop/PQHS500/HW4/toy_example/toy2.csv") %>% tbl_df
+
+toy
+```
+
+## The Codebook for the `toy` data
+
+```{r}
+toy.codebook <- data_frame(
+    Variable = dput(names(toy)),
+    Type = c("Subject ID", "2-level categorical (0/1)", "Quantitative (2 decimal places)",
+                         "2-level categorical (0/1)", "Quantitative (1 decimal place)",
+                         "Quantitative (1 decimal place)", "Integer",
+                         "3-level ordinal factor", "Quantitative outcome",
+                         "Binary outcome (did event occur?)", "Time to event outcome"),
+    Notes = c("labels are T_001 to T_400", "0 = control, 1 = treated", 
+              "reasonable values range from 0 to 6", "0 = no, 1 = yes",
+              "plausible range 3-20", "plausible range 3-20", "plausible range 3-20", 
+              "1 = Low, 2 = Middle, 3 = High",
+              "typical values 10-100", "Yes/No (note: event is bad)", 
+              "Time before event is observed or subject exits study (censored), range is 76-154 weeks"))
+
+toy.codebook
+```
+
+With regard to the `out3.time` variable, subjects with `out2.event` = No were censored, so that `out2.event` = Yes indicates an observed event.
+
+## "Skimmed" Summaries, within treatment groups
+
+```{r}
+toy %>% group_by(treated) %>% skim(-subject)
+```
+
+## Table 1 
+
+```{r}
+factorlist <- c("covB", "covF", "out2.event")
+
+CreateTableOne(data = toy,
+    vars = dput(names(select(toy, -subject, -treated))), 
+    strata = "treated", factorVars = factorlist)
+```
+
+# Data Management and Cleanup
+
+## Range Checks for Quantitative (continuous) Variables
+
+Checking and cleaning the quantitative variables is pretty straightforward - the main thing I'll do at this stage is check the ranges of values shown to ensure that they match up with what I'm expecting. Here, all of the quantitative variables have values that fall within the "permissible" range described by my codebook, so we'll assume that for the moment, we're OK on `subject` (just a meaningless code, really), `covA`, `covC`, `covD`, `covE`, `out1.cost` and `out3.time`, and we see no missingness.
+
+## Restating Categorical Information in Helpful Ways
+
+The cleanup of the toy data focuses, as it usually does, on variables that contain **categories** of information, rather than simple counts or measures, represented in quantitative variables. 
+
+### Re-expressing Binary Variables as Numbers and Factors
+
+We have three binary variables (`treated`, `covB` and `out2.event`). A major issue in developing these variables is to ensure that the direction of resulting odds ratios and risk differences are consistent and that cross-tabulations are in standard epidemiological format. 
+
+It will be useful to define binary variables in two ways: 
+
+- as a numeric indicator variable taking on the values 0 (meaning "not having the characteristic being studied") or 1 (meaning "having the characteristic being studied") 
+- as a text factor - with the levels of our key exposure and outcomes arranged so that "having the characteristic" precedes "not having the characteristic" in R when you create a table, but the covariates should still be No/Yes.
+
+So what do we currently have? From the output below, it looks like `treated` and `covB` are numeric, 0/1 variables, while `out2.event` is a factor with levels "No" and then "Yes"
+
+```{r}
+toy %>% select(treated, covB, out2.event) %>% summary()
+```
+
+So, we'll create factors for `treated` and `covB`:
+
+```{r}
+toy$treated_f <- factor(toy$treated, levels = c(1,0), 
+                        labels = c("Treated", "Control"))
+toy$covB_f <- factor(toy$covB, levels = c(0,1), 
+                     labels = c("No B", "Has B"))
+```
+
+For `out2.event`, on the other hand, we don't have either quite the way we might want it. As you see in the summary output, we have two codes for `out2.event` - either No or Yes, in that order. But we want Yes to precede No (and I'd like a more meaningful name). So I redefine the factor variable, as follows.
+
+```{r}
+toy$out2_f <- factor(toy$out2.event, levels = c("Yes","No"), 
+                     labels = c("Event","No Event"))
+```
+
+To obtain a numerical (0 or 1) version of `out2.event` we can use R's `as.numeric` function - the problem is that this produces values of 1 (for No) and 2 (for Yes), rather than 0 and 1. So, I simply subtract 1 from the result, and we get what we need.
+
+```{r}
+toy$out2 <- as.numeric(toy$out2.event) - 1
+```
+
+### Testing Your Code - Sanity Checks
+
+Before I move on, I'll do a series of sanity checks to make sure that our new variables are defined as we want them, by producing a series of small tables comparing the new variables to those originally included in the data set.
+
+```{r}
+toy %>% count(treated, treated_f)
+
+toy %>% count(covB, covB_f)
+
+toy %>% count(out2.event, out2_f, out2)
+```
+
+Everything looks OK:
+
+- `treated_f` correctly captures the information in `treated`, with the label Treated above the label Control in the rows of the table, facilitating standard epidemiological format.
+- `covB_f` also correctly captures the `covB` information, placing "Has B" last.
+- `out2_f` correctly captures and re-orders the labels from the original `out2.event`
+- `out2` shows the data correctly (as compared to the original `out2.event`) with 0-1 coding.
+
+## Dealing with Variables including More than Two Categories
+
+When we have a multi-categorical (more than two categories) variable, like `covF`, we will want to have
+
+- both a text version of the variable with sensibly ordered levels, as a factor in R, as well as 
+- a series of numeric indicator variables (taking the values 0 or 1) for the individual levels.
+
+```{r}
+toy %>% count(covF)
+```
+
+From the `summary` output, we can see that we're all set for the text version of `covF`, as what we have currently is a factor with three levels, labeled 1-Low, 2-Middle and 3-High. This list of variables should work out well for us, as it preserves the ordering in a table and permits us to see the names, too. If we'd used just Low, Middle and High, then when R sorted a table into alphabetical order, we'd have High, then Low, then Middle - not ideal.
+
+### Preparing Indicator Variables for `covF`
+
+So, all we need to do for `covF` is prepare indicator variables. We can either do this for all levels, or select one as the baseline, and do the rest. Here, I'll show them all.
+
+```{r}
+toy <- toy %>%
+    mutate(covF.Low = as.numeric(covF == "1-Low"),
+           covF.Middle = as.numeric(covF == "2-Middle"),
+           covF.High = as.numeric(covF == "3-High"))
+```
+
+And now, some more sanity checks for the `covF` information:
+
+```{r}
+toy %>% count(covF, covF.High, covF.Middle, covF.Low)
+```
+
+## Creating the Transformation and Product Terms
+
+Remember that we have reason to believe that the square of `covA` as well as the interaction of `covB` with `covC` and also `covB` with `covD` will have an impact on treatment assignment. It will be useful to have these transformations in our data set for modeling and summarizing. I will use `covB` in its numeric (0,1) form (rather than as a factor - `covB.f`) when creating product terms, as shown below.
+
+```{r}
+toy <- toy %>%
+    mutate(Asqr = covA^2,
+           BC = covB*covC,
+           BD = covB*covD)
+```
+
+# Data Set After Cleaning {.tabset}
+
+## Skim, within Treatment Groups
+
+```{r}
+toy %>% select(treated_f, covA, covB, covC, covD, covE, 
+               covF, Asqr, BC, BD, out1.cost, out2, out3.time) %>%
+    group_by(treated_f) %>%
+    skim()
+```
+
+## Table 1
+
+Note that the factors I created for the `out2` outcome are not well ordered for a Table 1, but are well ordered for other tables we'll fit later. So, in this case, I'll use the numeric version of the `out2` outcome, but the new factor representations of `covB` and `treated`.
+
+```{r}
+varlist = c("covA", "covB_f", "covC", "covD", "covE", "covF", 
+            "Asqr", "BC", "BD", "out1.cost", "out2", "out3.time")
+factorlist = c("covB_f", "covF", "out2")
+CreateTableOne(vars = varlist, strata = "treated_f", 
+               data = toy, factorVars = factorlist)
+```
+
+
+# The 13 Tasks We'll Tackle in this Example
+
+1. Ignoring the covariate information, what is the unadjusted point estimate (and 95% confidence interval) for the effect of the treatment on each of the three outcomes (`out1.cost`, `out2.event`, and `out3.time`)?
+2. Assume that theory suggests that the square of `covA`, as well as the interactions of `covB` with `covC` and `covB` with `covD` should be related to treatment assignment. Fit a propensity score model to the data, using the six covariates (A-F) and the three transformations (A^2^, and the B-C and B-D interactions.) Plot the resulting propensity scores, by treatment group, in an attractive and useful way.
+3. Use Rubin's Rules to assess the overlap of the propensity scores and the individual covariates prior to the use of any propensity score adjustments.
+4. Use 1:1 greedy matching to match all 140 treated subjects  to control subjects without replacement on the basis of the linear propensity for treatment. Evaluate the degree of covariate imbalance before and after propensity matching for each of the six covariates, and present the pre- and post-match standardized differences and variance ratios for the covariates, as well as the square term and interactions, as well as both the raw and linear propensity score in appropriate plots. Now, build a new data frame containing the propensity-matched sample, and use it to first check Rubin's Rules after matching.
+5. Now, use the matched sample data set to evaluate the treatment's average causal effect on each of the three outcomes. In each case, specify a point estimate (and associated 95% confidence interval) for the effect of being treated (as compared to being a control subject) on the outcome. Compare your results to the automatic versions reported by the Matching package when you include the outcome in the matching process.
+6. Now, instead of matching, instead subclassify the subjects into quintiles by the raw propensity score. Display the balance in terms of standardized differences by quintile for the covariates, their transformations, and the propensity score in an appropriate table or plot(s). Are you satisfied? 
+7. Regardless of your answer to the previous question, use the propensity score quintile subclassification approach to find a point estimate (and 95% confidence interval) for the effect of the treatment on each outcome. 
+8. Now using a reasonable propensity score weighting strategy, assess the balance of each covariate, the transformations and the linear propensity score prior to and after propensity weighting. Is the balance after weighting satisfactory?
+9. Using propensity score weighting to evaluate the treatment's effect, developing a point estimate and 95% CI for the average causal effect of treatment on each outcome.
+10. Finally, use direct adjustment for the linear propensity score on the entire sample to evaluate the treatment's effect, developing a point estimate and 95% CI for each outcome.
+11. Now, try a double robust approach. Weight, then adjust for linear propensity score.
+12. Compare your conclusions about the average causal effect obtained in the following six ways to each other. What happens and why? Which of these methods seems most appropriate given the available information?
+    + without propensity adjustment, 
+    + after propensity matching, 
+    + after propensity score subclassification, 
+    + after propensity score weighting, 
+    + after adjusting for the propensity score directly, and 
+    + after weighting then adjusting for the PS, to each other.  
+13. Perform a sensitivity analysis for your matched samples analysis and the first outcome (`out1.cost`) if it turns out to show a statistically significant treatment effect.
+
+# Task 1. Ignoring covariates, estimate the effect of treatment vs. control on...
+
+## Outcome 1 (a continuous outcome)
+
+Our first outcome describes a quantitative measure, cost, and we're asking what the effect of `treatment` as compared to `control` is on that outcome. Starting with brief numerical summaries:
+
+```{r}
+toy %>%
+    group_by(treated_f) %>%
+    skim(out1.cost)
+```
+
+It looks like the Treated group has higher costs than the Control group. To model this, we could use a linear regression model to obtain a point estimate and 95% confidence interval. Here, I prefer to use the numeric version of the `treated` variable, with 0 = "control" and 1 = "treated".
+
+```{r}
+unadj.out1 <- lm(out1.cost ~ treated, data=toy)
+summary(unadj.out1); confint(unadj.out1, level = 0.95) ## provides treated effect and CI estimates
+```
+
+We can store these results in a data frame, with the `tidy` function from the `broom` package.
+
+```{r}
+tidy(unadj.out1, conf.int = TRUE, conf.level = 0.95)
+```
+
+```{r}
+res_unadj_1 <- tidy(unadj.out1, conf.int = TRUE, conf.level = 0.95) %>%
+    filter(term == "treated")
+
+res_unadj_1
+```
+
+Our unadjusted treatment effect estimate is a difference of `r decim(res_unadj_1$estimate,2)` in cost, with 95% confidence interval (`r decim(res_unadj_1$conf.low,2)`, `r decim(res_unadj_1$conf.high,2)`).
+
+
+## Unadjusted Estimates of Treatment Effect on Outcomes
+
+So, our unadjusted average treatment effect estimates (in each case comparing treated subjects to control subjects) are thus:
+
+Est. Treatment Effect (95% CI) | Outcome 1 (Cost diff.) 
+----------------: | -----------: 
+No covariate adjustment | **`r decim(res_unadj_1$estimate,2)`** 
+(unadjusted) | (`r decim(res_unadj_1$conf.low,2)`, `r decim(res_unadj_1$conf.high,2)`) 
+
+# Task 2. Fit the propensity score model, then plot the PS-treatment relationship
+
+I'll use a logistic regression model
+
+```{r}
+psmodel <- glm(treated ~ covA + covB + covC + covD + covE + covF + 
+                   Asqr + BC + BD, family=binomial(), data=toy)
+summary(psmodel)
+```
+
+Having fit the model, my first step will be to save the raw and linear propensity score values to the main toy example tibble.
+
+```{r}
+toy$ps <- psmodel$fitted
+toy$linps <- psmodel$linear.predictors
+```
+
+## Comparing the Distribution of Propensity Score Across the Two Treatment Groups
+
+Now, I can use these saved values to assess the propensity model.
+
+```{r}
+toy %>% group_by(treated_f) %>% skim(ps, linps)
+```
+
+The simplest plot is probably a boxplot, but it's not very granular.
+
+```{r}
+ggplot(toy, aes(x = treated_f, y = ps)) +
+    geom_boxplot()
+```
+
+```{r}
+ggplot(toy, aes(x = treated_f, y = ps, color = treated_f)) + 
+    geom_boxplot() +
+    geom_jitter(width = 0.1) + 
+    guides(color = FALSE)
+```
+
+I'd rather get a fancier plot to compare the distributions of the propensity score across the two treatment groups, perhaps using a smoothed density estimate, as shown below. Here, I'll show the distributions of the linear propensity score, the log odds of treatment.
+
+```{r}
+ggplot(toy, aes(x = linps, fill = treated_f)) +
+    geom_density(alpha = 0.3)
+```
+
+We see a fair amount of overlap across the two treatment groups. I'll use Rubin's Rules in the next section to help assess the amount of overlap at this point, before any adjustments for the propensity score.
+
+# Task 3. Rubin's Rules to Check Overlap Before Propensity Adjustment
+
+In his 2001 article[^1] about using propensity scores to design studies, as applied to studies of the causal effects of the conduct of the tobacco industry on medical expenditures, Donald Rubin proposed three "rules" for assessing the overlap / balance of covariates appropriately before and after propensity adjustment.  Before an outcome is evaluated using a regression analysis (perhaps supplemented by a propensity score adjustment through matching, weighting, subclassification or even direct adjustment), there are three checks that should be performed.
+
+When we do a propensity score analysis, it will be helpful to perform these checks as soon as the propensity model has been estimated, even before any adjustments take place, to see how well the distributions of covariates overlap. After using the propensity score, we hope to see these checks meet the standards below. In what follows, I will describe each standard, and demonstrate its evaluation using the propensity score model we just fit, and looking at the original `toy` data set, without applying the propensity score in any way to do adjustments.
+
+## Rubin's Rule 1
+
+Rubin's Rule 1 states that the absolute value of the standardized difference of the linear propensity score, comparing the treated group to the control group, should be close to 0, ideally below 10%, and in any case less than 50%. If so, we may move on to Rule 2.
+
+To evaluate this rule in the toy example, we'll run the following code to place the right value into a variable called `rubin1.unadj` (for Rubin's Rule 1, unadjusted).
+
+```{r}
+rubin1.unadj <- with(toy,
+     abs(100*(mean(linps[treated==1])-mean(linps[treated==0]))/sd(linps)))
+rubin1.unadj
+```
+
+What this does is calculate the (absolute value of the) standardized difference of the linear propensity score comparing treated subjects to control subjects. 
+
+- We want this value to be close to 0, and certainly less than 50 in order to push forward to outcomes analysis without further adjustment for the propensity score. 
+- Clearly, here, with a value above 50%, we can't justify simply running an unadjusted regression model, be it a linear, logistic or Cox model - we've got observed selection bias, and need to actually apply the propensity score somehow in order to account for this. 
+- So, we'll need to match, subclassify, weight or directly adjust for propensity here.
+
+Since we've failed Rubin's 1st Rule, in some sense, we're done checking the rules, because we clearly need to further adjust for observed selection bias - there's no need to prove that further through checking Rubin's 2nd and 3rd rules. But we'll do it here to show what's involved.
+
+[^1]: Rubin DB 2001 Using Propensity Scores to Help Design Observational Studies: Application to the Tobacco Litigation. *Health Services & Outcomes Research Methodology* 2: 169-188.
+
+## Rubin's Rule 2
+
+Rubin's Rule 2 states that the ratio of the variance of the linear propensity score in the treated group to the variance of the linear propensity score in the control group should be close to 1, ideally between 4/5 and 5/4, but certainly not very close to or exceeding 1/2 and 2. If so, we may move on to Rule 3.
+
+To evaluate this rule in the toy example, we'll run the following code to place the right value into a variable called `rubin2.unadj` (for Rubin's Rule 2, unadjusted).
+
+```{r}
+rubin2.unadj <-with(toy, var(linps[treated==1])/var(linps[treated==0]))
+rubin2.unadj
+```
+
+This is the ratio of variances of the linear propensity score comparing treated subjects to control subjects. We want this value to be close to 1, and certainly between 0.5 and 2. In this case, we pass Rule 2, if just barely.
+
+## Rubin's Rule 3
+
+For Rubin's Rule 3, we begin by calculating regression residuals for each covariate of interest (usually, each of those included in the propensity model) regressed on a single predictor - the linear propensity score. We then look to see if the ratio of the variance of the residuals of this model for the treatment group divided by the variance of the residuals of this model for the control group is close to 1. Again, ideally this will fall between 4/5 and 5/4 for each covariate, but certainly between 1/2 and 2. If so, then the use of regression models seems well justified.
+
+To evaluate Rubin's 3rd Rule, we'll create a little function to help us do the calculations.
+
+```{r rubin3 function}
+## General function rubin3 to help calculate Rubin's Rule 3
+rubin3 <- function(data, covlist, linps) {
+  covlist2 <- as.matrix(covlist)
+  res <- NA
+  for(i in 1:ncol(covlist2)) {
+    cov <- as.numeric(covlist2[,i])
+    num <- var(resid(lm(cov ~ data$linps))[data$exposure == 1])
+    den <- var(resid(lm(cov ~ data$linps))[data$exposure == 0])
+    res[i] <- decim(num/den, 3)
+  }
+  final <- data_frame(name = names(covlist), resid.var.ratio = as.numeric(res))
+  return(final)
+}
+```
+
+Now, then, applying the rule to our sample prior to propensity score adjustment, we get the following result. Note that I'm using the indicator variable forms for the `covF` information.
+
+```{r}
+cov.sub <- toy %>% select(covA, covB, covC, covD, covE,
+                         covF.Middle, covF.High, Asqr, BC, BD)
+
+toy$exposure <- toy$treated
+
+rubin3.unadj <- rubin3(data = toy, covlist = cov.sub, linps = linps)
+rubin3.unadj
+```
+
+Some of these covariates look to have residual variance ratios near 1, while others are further away, but all are within the (0.5, 2.0) range. So we'd pass Rule 3 here, although we'd clearly like to see some covariates (A and E, in particular) with ratios closer to 1.
+
+### A Cleveland Dot Chart of the Rubin's Rule 3 Results
+
+```{r rubin3_chart}
+ggplot(rubin3.unadj, aes(x = resid.var.ratio, y = reorder(name, resid.var.ratio))) +
+    geom_point(col = "blue", size = 2) + 
+    theme_bw() +
+    xlim(0.5, 2.0) +
+    geom_vline(aes(xintercept = 1)) +
+    geom_vline(aes(xintercept = 4/5), linetype = "dashed", col = "red") +
+    geom_vline(aes(xintercept = 5/4), linetype = "dashed", col = "red") +
+  labs(x = "Residual Variance Ratio", y = "") 
+```
+
+We see values outside the 4/5 and 5/4 lines, but nothing falls outside (0.5, 2).
+
+# Task 4. Use 1:1 greedy matching on the linear PS, then check post-match balance
+
+As requested, we'll do 1:1 greedy matching on the linear propensity score without replacement and breaking ties randomly. To start, we won't include an outcome variable in our call to the `Match` function within the `Matching` package We'll wind up with a match including 140 treated and 140 control subjects.
+
+```{r}
+X <- toy$linps ## matching on the linear propensity score
+Tr <- as.logical(toy$treated)
+match1 <- Match(Tr=Tr, X=X, M = 1, replace=FALSE, ties=FALSE)
+summary(match1)
+```
+
+## Balance Assessment (Semi-Automated)
+
+Next, we'll assess the balance imposed by this greedy match on our covariates, and their transformations (`A`^2 and `B*C` and `B*D`) as well as the raw and linear propensity scores. The default output from the `MatchBalance` function is extensive...
+
+```{r}
+set.seed(5001)
+mb1 <- MatchBalance(treated ~ covA + covB + covC + covD + covE + covF + 
+                        Asqr + BC + BD + ps + linps, data=toy, 
+                    match.out = match1, nboots=500)
+```
+
+The `cobalt` package has some promising tools for taking this sort of output and turning it into something useful. We'll look at that approach soon. For now, some old-school stuff...
+
+## Extracting, Tabulating Standardized Differences (without `cobalt`)
+
+We'll start by naming the covariates that the `MatchBalance` output contains...
+
+```{r}
+covnames <- c("covA", "covB", "covC", "covD", "covE", 
+              "covF - Middle", "covF - High", 
+              "A^2","B*C", "B*D", "raw PS", "linear PS")
+```
+
+The next step is to extract the standardized differences (using the pooled denominator to estimate, rather than the treatment-only denominator used in the main output above.)
+
+```{r}
+pre.szd <- NULL; post.szd <- NULL
+for(i in 1:length(covnames)) {
+  pre.szd[i] <- mb1$BeforeMatching[[i]]$sdiff.pooled
+  post.szd[i] <- mb1$AfterMatching[[i]]$sdiff.pooled
+}
+```
+
+Now, we can build a table of the standardized differences:
+
+```{r}
+match_szd <- data.frame(covnames, pre.szd, post.szd, row.names=covnames)
+print(match_szd, digits=3)
+```
+
+And then, we could plot these, or their absolute values. Here's what that looks like.
+
+## A Love Plot describing Standardized Differences Before/After Matching (without `cobalt`)
+
+```{r}
+ggplot(match_szd, aes(x = pre.szd, y = reorder(covnames, pre.szd))) +
+    geom_point(col = "black", size = 3, pch = 1) + 
+    geom_point(aes(x = post.szd, y = reorder(covnames, pre.szd)), 
+               size = 3, col = "blue") +
+    theme_bw() +
+    geom_vline(aes(xintercept = 0)) +
+    geom_vline(aes(xintercept = 10), linetype = "dashed", col = "red") +
+    geom_vline(aes(xintercept = -10), linetype = "dashed", col = "red") +
+    labs(x = "Standardized Difference (%)", y = "") 
+```
+
+## Using `cobalt` to build a "Love Plot" after Matching
+
+```{r }
+b <- bal.tab(match1, treated ~ covA + covB + covC + covD + covE + covF + 
+                        Asqr + BC + BD + ps + linps, data=toy, un = TRUE)
+b
+```
+
+### Building a Plot of Standardized Differences, with `cobalt`
+
+```{r }
+p <- love.plot(b, threshold = .1, size = 1.5,
+               var.order = "unadjusted",
+               title = "Standardized Differences and 1:1 Matching")
+p + theme_bw()
+```
+
+### Building a Plot of Variance Ratios, with `cobalt`
+
+```{r }
+p <- love.plot(b, stat = "v",
+               threshold = 1.25, size = 1.5,
+               var.order = "unadjusted",
+               title = "Variance Ratios and 1:1 Matching")
+p + theme_bw()
+```
+
+## Extracting, Tabulating Variance Ratios (without `cobalt`)
+
+Next, we extract the variance ratios, and build a table.
+
+```{r}
+pre.vratio <- NULL; post.vratio <- NULL
+for(i in 1:length(covnames)) {
+  pre.vratio[i] <- mb1$BeforeMatching[[i]]$var.ratio
+  post.vratio[i] <- mb1$AfterMatching[[i]]$var.ratio
+}
+
+## Table of Variance Ratios
+match_vrat <- data.frame(names = covnames, pre.vratio, post.vratio, row.names=covnames)
+print(match_vrat, digits=2)
+```
+
+## Creating a New Data Frame, Containing the Matched Sample (without `cobalt`)
+
+Now, we build a new matched sample data frame in order to do some of the analyses to come. This will contain only the 280 matched subjects (140 treated and 140 control).
+
+```{r}
+matches <- factor(rep(match1$index.treated, 2))
+toy.matchedsample <- cbind(matches, toy[c(match1$index.control, match1$index.treated),])
+```
+
+Some sanity checks:
+
+```{r}
+toy.matchedsample %>% count(treated_f)
+
+head(toy.matchedsample)
+```
+
+## Rubin's Rules to Check Balance After Matching
+
+### Rubin's Rule 1
+
+Rubin's Rule 1 states that the absolute value of the standardized difference of the linear propensity score, comparing the treated group to the control group, should be close to 0, ideally below 10%, and in any case less than 50%. If so, we may move on to Rule 2.
+
+Recall that our result without propensity matching (or any other adjustment) was 
+
+```{r}
+rubin1.unadj
+```
+
+To run this for our matched sample, we use:
+
+```{r}
+rubin1.match <- with(toy.matchedsample,
+      abs(100*(mean(linps[treated==1])-mean(linps[treated==0]))/sd(linps)))
+rubin1.match
+```
+
+Here, we've at least got this value down below 50\%, so we would pass Rule 1, although perhaps a different propensity score adjustment (perhaps by weighting or subclassification, or using a different matching approach) might improve this result by getting it closer to 0.
+
+### Rubin's Rule 2
+
+Rubin's Rule 2 states that the ratio of the variance of the linear propensity score in the treated group to the variance of the linear propensity score in the control group should be close to 1, ideally between 4/5 and 5/4, but certainly not very close to or exceeding 1/2 and 2. If so, we may move on to Rule 3.
+
+Recall that our result without propensity matching (or any other adjustment) was 
+
+```{r}
+rubin2.unadj
+```
+
+To run this for our matched sample, we use:
+
+```{r}
+rubin2.match <- with(toy.matchedsample, var(linps[treated==1])/var(linps[treated==0]))
+rubin2.match
+```
+
+This is moderately promising - a substantial improvement over our unadjusted result, and now, just barely within our desired range of 4/5 to 5/4, and clearly within 1/2 to 2. 
+
+We pass Rule 2, as well.
+
+### Rubin's Rule 3
+
+For Rubin's Rule 3, we begin by calculating regression residuals for each covariate of interest (usually, each of those included in the propensity model) regressed on a single predictor - the linear propensity score. We then look to see if the ratio of the variance of the residuals of this model for the treatment group divided by the variance of the residuals of this model for the control group is close to 1. Again, ideally this will fall between 4/5 and 5/4 for each covariate, but certainly between 1/2 and 2. If so, then the use of regression models seems well justified.
+
+Recall that our result without propensity matching (or any other adjustment) was 
+
+```{r}
+rubin3.unadj
+```
+
+After propensity matching, we use this code to assess Rubin's 3rd Rule in our matched sample.
+
+```{r}
+cov.sub <- dplyr::select(toy.matchedsample,
+                         covA, covB, covC, covD, covE,
+                         covF.Middle, covF.High, Asqr, BC, BD)
+
+toy.matchedsample$exposure <- toy.matchedsample$treated
+
+rubin3.matched <- rubin3(data = toy.matchedsample, covlist = cov.sub, linps = linps)
+
+rubin3.matched
+```
+
+It looks like the results are basically unchanged, except that `covF.High` is improved. The dotplot of these results comparing pre- to post-matching is shown below.
+
+### A Cleveland Dot Chart of the Rubin's Rule 3 Results Pre vs. Post-Match
+
+```{r rubin3 dot chart pre and post match}
+rubin3.both <- bind_rows(rubin3.unadj, rubin3.matched)
+rubin3.both$source <- c(rep("Unmatched",10), rep("Matched", 10))
+
+ggplot(rubin3.both, aes(x = resid.var.ratio, y = name, col = source)) +
+    geom_point(size = 2) + 
+    theme_bw() +
+    xlim(0.5, 2.0) +
+    geom_vline(aes(xintercept = 1)) +
+    geom_vline(aes(xintercept = 4/5), linetype = "dashed", col = "red") +
+    geom_vline(aes(xintercept = 5/4), linetype = "dashed", col = "red") +
+  labs(x = "Residual Variance Ratio", y = "") 
+```
+
+Some improvement to report, overall.
+
+# Task 5. After matching, estimate the causal effect of treatment on ...
+
+## Outcome 1 (a continuous outcome)
+
+### Approach 1. Automated Approach from the Matching package - ATT Estimate
+
+First, we'll look at the essentially automatic answer which can be obtained when using the `Matching` package and inserting an outcome Y. For a continuous outcome, this is often a reasonable approach.
+
+```{r}
+X <- toy$linps ## matching on the linear propensity score
+Tr <- as.logical(toy$treated)
+Y <- toy$out1.cost
+match1.out1 <- Match(Y=Y, Tr=Tr, X=X, M = 1, replace=FALSE, ties=FALSE)
+summary(match1.out1)
+```
+
+The estimate is `r decim(match1.out1$est.noadj, 2)` with standard error `r decim(match1.out1$se.standard,2)`. We can obtain an approximate 95% confidence interval by adding and subtracting 1.96 times (or just double) the standard error (SE) to the point estimate, `r decim(match1.out1$est.noadj, 2)`. Here, using the 1.96 figure, that would yields an approximate 95% CI of (`r decim(match1.out1$est.noadj - 1.96*match1.out1$se.standard, 2)`, `r decim(match1.out1$est.noadj + 1.96*match1.out1$se.standard, 2)`).
+
+### Approach 2. Automated Approach from the Matching package - ATE Estimate
+
+```{r}
+match1.out1.ATE <- Match(Y=Y, Tr=Tr, X=X, M = 1, replace=FALSE, ties=FALSE, estimand="ATE")
+summary(match1.out1.ATE)
+```
+
+And our 95% CI for this ATE estimate would be `r decim(match1.out1.ATE$est.noadj, 2)` $\pm$ 1.96(`r decim(match1.out1.ATE$se.standard, 2)`), or (`r decim(match1.out1.ATE$est.noadj - 1.96*match1.out1.ATE$se.standard, 2)`, `r decim(match1.out1.ATE$est.noadj + 1.96*match1.out1.ATE$se.standard, 2)`), but we'll stick with the ATT estimate for now.
+
+### ATT vs. ATE: Definitions
+
+- Informally, the **average treatment effect on the treated** (ATT) estimate describes the difference in potential outcomes (between treated and untreated subjects) summarized across the population of people who actually received the treatment. 
+    + In our initial match, we identified a unique and nicely matched control patient for each of the 140 people in the treated group. We have a 1:1 match on the treated, and thus can describe subjects across that set of treated patients reasonably well.
+- On the other hand the **average treatment effect** (ATE) refers to the difference in potential outcomes summarized across the entire population, including those who did not receive the treatment.  
+    + In our ATE match, we have less success, in part because if we match to the treated patients in a 1:1 way, we'll have an additional 120 unmatched control patients, about whom we can describe results only vaguely. We could consider matching up control patients to treated patients, perhaps combined with a willingness to re-use some of the treated patients to get a better estimate across the whole population.
+
+### Approach 3. Mirroring the Paired T test in a Regression Model
+
+We can mirror the paired t test result in a regression model that treats the match identifier as a fixed factor in a linear model, as follows. This takes the pairing into account, but treating pairing as a fixed, rather than random, factor, isn't really satisfactory as a solution, although it does match the paired t test.
+
+```{r}
+adj.m.out1 <- lm(out1.cost ~ treated + factor(matches), data=toy.matchedsample) 
+
+adj.m.out1.tidy <- tidy(adj.m.out1, conf.int = TRUE) %>% 
+    filter(term == "treated")
+
+adj.m.out1.tidy
+```
+
+So, this regression approach produces an estimate that is exactly the same as the paired t test[^2], but this isn't something I'm completely comfortable with.
+
+[^2]: I'll leave checking that this is true as an exercise for the curious.
+
+### Approach 4. A Mixed Model to account for 1:1 Matching
+
+What I think of as a more appropriate result comes from a mixed model where the matches are treated as a random factor, but the treatment group is treated as a fixed factor. This is developed like this, using the `lme4` package. Note that we have to create a factor variable to represent the matches, since that's the only thing that `lme4` understands.
+
+```{r}
+toy.matchedsample$matches.f <- as.factor(toy.matchedsample$matches) 
+## Need to use matches as a factor in R here
+
+matched_mixedmodel.out1 <- lmer(out1.cost ~ treated + (1 | matches.f), data=toy.matchedsample)
+summary(matched_mixedmodel.out1); confint(matched_mixedmodel.out1)
+```
+
+The `tidy` approach works with this linear mixed model, so we have:
+
+```{r}
+res_matched_1 <- tidy(matched_mixedmodel.out1, conf.int = TRUE, conf.level = 0.95) %>% 
+    filter(term == "treated")
+
+res_matched_1
+```
+
+Our estimate is `r decim(res_matched_1$estimate, 2)`, with 95% CI ranging from `r decim(res_matched_1$conf.low, 2)` to `r decim(res_matched_1$conf.high, 2)`.
+
+### Practically, does any of this matter in this example?
+
+Not much in this example, no, as long as you stick to ATT approaches.
+
+Approach | Effect Estimate | Standard Error | 95% CI
+----------------------: | ---------: | --------: | ---------------
+"Automated" ATT via `Match` | `r decim(match1.out1$est.noadj, 2)` | `r decim(match1.out1$se.standard,2)` | (`r decim(match1.out1$est.noadj - 1.96*match1.out1$se.standard, 2)`, `r decim(match1.out1$est.noadj + 1.96*match1.out1$se.standard, 2)`)
+Linear Model (pairs as fixed factor) | `r decim(adj.m.out1.tidy$estimate, 2)` | `r decim(adj.m.out1.tidy$std.error, 2)` | (`r decim(adj.m.out1.tidy$conf.low, 2)`, `r decim(adj.m.out1.tidy$conf.high, 2)`)
+Mixed Model (pairs as random factor) | `r decim(res_matched_1$estimate, 2)` | `r decim(res_matched_1$std.error, 2)` | (`r decim(res_matched_1$conf.low, 2)`, `r decim(res_matched_1$conf.high, 2)`)
+
+
+## Results So Far (After Propensity Matching)
+
+So, here's our summary again, now incorporating both our unadjusted results and the results after matching. Automated results and my favorite of our various non-automated approaches are shown. Note that I've left out the "automated" approach for a time-to-event outcome entirely, so as to discourage you from using it. 
+
+Est. Treatment Effect (95% CI) | Outcome 1 (Cost diff.) 
+----------------: | -----------: 
+No covariate adjustment | **`r decim(res_unadj_1$estimate,2)`** 
+(unadjusted) | (`r decim(res_unadj_1$conf.low,2)`, `r decim(res_unadj_1$conf.high,2)`) 
+After 1:1 PS Match | **`r decim(match1.out1$est.noadj, 2)`** 
+(`Match`: Automated) | (`r decim(match1.out1$est.noadj - 1.96*match1.out1$se.standard, 2)`, `r decim(match1.out1$est.noadj + 1.96*match1.out1$se.standard, 2)`) 
+After 1:1 PS Match | **`r decim(res_matched_1$estimate, 2)`** 
+("Regression" Models) | (`r decim(res_matched_1$conf.low, 2)`, `r decim(res_matched_1$conf.high, 2)`) 
+
+# Task 6. Subclassify by PS quintile, then display post-subclassification balance
+
+First, we divide the data by the propensity score into 5 strata of equal size using the `cut2` function from the `Hmisc` package. Then we create a `quintile` variable which specifies 1 = lowest propensity scores to 5 = highest.
+
+```{r}
+toy$stratum <- Hmisc::cut2(toy$ps, g=5)
+
+toy %>% group_by(stratum) %>% skim(ps) ## sanity check
+```
+
+```{r}
+toy$quintile <- factor(toy$stratum, labels=1:5)
+
+toy %>% count(stratum, quintile) ## sanity check
+```
+
+## Check Balance and Propensity Score Overlap in Each Quintile
+
+We want to check the balance and propensity score overlap for each stratum (quintile.) I'll start with a set of facetted, jittered plots to look at overlap.
+
+```{r}
+ggplot(toy, aes(x = treated_f, y = round(ps,2), group = quintile, color = treated_f)) +
+    geom_jitter(width = 0.2) +
+    guides(color = FALSE) +
+    facet_wrap(~ quintile) +
+    labs(x = "", y = "Propensity for Treatment", 
+         title = "Quintile Subclassification in the Toy Example")
+```
+
+It can be helpful to know how many observations (by exposure group) are in each quintile.
+
+```{r}
+toy %>% count(quintile, treated_f)
+```
+
+With only 4 "treated" subjects in Quintile 1, I am concerned that we won't be able to do much there to create balance.
+
+The overlap may show a little better in the plot if you free up the y axes...
+
+```{r}
+ggplot(toy, aes(x = treated_f, y = round(ps,2), group = quintile, color = treated_f)) +
+    geom_jitter(width = 0.2) +
+    guides(color = FALSE) +
+    facet_wrap(~ quintile, scales = "free_y") +
+    labs(x = "", y = "Propensity for Treatment", 
+         title = "Quintile Subclassification in the Toy Example")
+```
+
+## Creating a Standardized Difference Calculation Function
+
+We'll need to be able to calculate standardized differences in this situation so I've created a simple `szd` function to do this - using the average denominator method.
+
+```{r}
+szd <- function(covlist, g) {
+  covlist2 <- as.matrix(covlist)
+  g <- as.factor(g)
+  res <- NA
+  for(i in 1:ncol(covlist2)) {
+    cov <- as.numeric(covlist2[,i])
+    num <- 100*diff(tapply(cov, g, mean, na.rm=TRUE))
+    den <- sqrt(mean(tapply(cov, g, var, na.rm=TRUE)))
+    res[i] <- round(num/den,2)
+  }
+  names(res) <- names(covlist)   
+  res
+}
+```
+
+
+## Creating the Five Subsamples, by PS Quintile
+
+Next, we split the complete sample into the five quintiles.
+
+```{r}
+## Divide the sample into the five quintiles
+quin1 <- filter(toy, quintile==1)
+quin2 <- filter(toy, quintile==2)
+quin3 <- filter(toy, quintile==3)
+quin4 <- filter(toy, quintile==4)
+quin5 <- filter(toy, quintile==5)
+```
+
+## Standardized Differences in Each Quintile, and Overall
+
+Now, we'll calculate the standardized differences for each covariate (note that we're picking up two of the indicators for our multi-categorical `covF`) within each quintile, as well as overall.
+
+```{r}
+covs <- c("covA", "covB", "covC", "covD", "covE", "covF.Middle", 
+          "covF.High", "Asqr","BC", "BD", "ps", "linps")
+d.q1 <- szd(quin1[covs], quin1$treated)
+d.q2 <- szd(quin2[covs], quin2$treated)
+d.q3 <- szd(quin3[covs], quin3$treated)
+d.q4 <- szd(quin4[covs], quin4$treated)
+d.q5 <- szd(quin5[covs], quin5$treated)
+d.all <- szd(toy[covs], toy$treated)
+
+toy.szd <- data_frame(covs, Overall = d.all, Q1 = d.q1, Q2 = d.q2, Q3 = d.q3, Q4 = d.q4, Q5 = d.q5)
+toy.szd <- gather(toy.szd, "quint", "sz.diff", 2:7)
+toy.szd
+```
+
+## Plotting the Standardized Differences
+
+```{r}
+ggplot(toy.szd, aes(x = sz.diff, y = reorder(covs, -sz.diff), group = quint)) + 
+    geom_point() +
+    geom_vline(xintercept = 0) +
+    geom_vline(xintercept = c(-10,10), linetype = "dashed", col = "blue") +
+    facet_wrap(~ quint) +
+    labs(x = "Standardized Difference, %", y = "",
+         title = "Comparing Standardized Differences by PS Quintile",
+         subtitle = "The toy example")
+```
+
+
+```{r}
+ggplot(toy.szd, aes(x = abs(sz.diff), y = covs, group = quint)) + 
+    geom_point() +
+    geom_vline(xintercept = 0) +
+    geom_vline(xintercept = 10, linetype = "dashed", col = "blue") +
+    facet_wrap(~ quint) +
+    labs(x = "|Standardized Difference|, %", y = "",
+         title = "Absolute Standardized Differences by PS Quintile",
+         subtitle = "The toy example")
+```
+
+## Checking Rubin's Rules Post-Subclassification
+
+### Rubin's Rule 1
+
+As a reminder, prior to adjustment, Rubin's Rule 1 for the `toy` example was:
+
+```{r}
+rubin1.unadj <- with(toy,
+                     abs(100*(mean(linps[treated==1]) -
+                                  mean(linps[treated==0]))/sd(linps)))
+rubin1.unadj
+```
+
+After propensity score subclassification, we can obtain the same summary within each of the five quintiles...
+
+```{r}
+rubin1.q1 <- with(quin1, abs(100*(mean(linps[treated==1]) - 
+                                      mean(linps[treated==0]))/sd(linps)))
+rubin1.q2 <- with(quin2, abs(100*(mean(linps[treated==1]) - 
+                                      mean(linps[treated==0]))/sd(linps)))
+rubin1.q3 <- with(quin3, abs(100*(mean(linps[treated==1]) - 
+                                      mean(linps[treated==0]))/sd(linps)))
+rubin1.q4 <- with(quin4, abs(100*(mean(linps[treated==1]) - 
+                                      mean(linps[treated==0]))/sd(linps)))
+rubin1.q5 <- with(quin5, abs(100*(mean(linps[treated==1]) - 
+                                      mean(linps[treated==0]))/sd(linps)))
+
+rubin1.sub <- c(rubin1.q1, rubin1.q2, rubin1.q3, rubin1.q4, rubin1.q5)
+names(rubin1.sub)=c("Q1", "Q2", "Q3", "Q4", "Q5")
+
+rubin1.sub
+```
+
+It was always a long shot that subclassification alone would reduce all of these values below 10%, but I had hoped to get them all below 50%. With only 4 "treated" subjects in Quintile 1, though, the task was too tough.
+
+### Rubin's Rule 2
+
+As a reminder, prior to adjustment, Rubin's Rule 2 for the `toy` example was:
+
+```{r}
+rubin2.unadj <- with(toy, var(linps[treated==1])/var(linps[treated==0]))
+rubin2.unadj
+```
+
+After Subclassification, we can obtain the same summary within each of the five quintiles...
+
+```{r}
+rubin2.q1 <- with(quin1, var(linps[treated==1])/var(linps[treated==0]))
+rubin2.q2 <- with(quin2, var(linps[treated==1])/var(linps[treated==0]))
+rubin2.q3 <- with(quin3, var(linps[treated==1])/var(linps[treated==0]))
+rubin2.q4 <- with(quin4, var(linps[treated==1])/var(linps[treated==0]))
+rubin2.q5 <- with(quin5, var(linps[treated==1])/var(linps[treated==0]))
+
+rubin2.sub <- c(rubin2.q1, rubin2.q2, rubin2.q3, rubin2.q4, rubin2.q5)
+names(rubin2.sub)=c("Q1", "Q2", "Q3", "Q4", "Q5")
+
+rubin2.sub
+```
+
+Some of these variance ratios are actually a bit further from 1 than the full data set. Again, with a small sample size like this, subclassification looks like a weak choice. At most, three of the quintiles (3-4 and maybe 5) show OK variance ratios after propensity score subclassification.
+
+### Rubin's Rule 3
+
+Prior to propensity adjustment, recall that Rubin's Rule 3 summaries were:
+
+```{r}
+covs <- c("covA", "covB", "covC", "covD", "covE", 
+          "covF.Middle", "covF.High", "Asqr","BC", "BD")
+rubin3.unadj <- rubin3(data=toy, covlist=toy[covs])
+```
+
+After subclassification, then, Rubin's Rule 3 summaries within each quintile are:
+
+```{r}
+rubin3.q1 <- rubin3(data=quin1, covlist=quin1[covs])
+rubin3.q2 <- rubin3(data=quin2, covlist=quin2[covs])
+rubin3.q3 <- rubin3(data=quin3, covlist=quin3[covs])
+rubin3.q4 <- rubin3(data=quin4, covlist=quin4[covs])
+rubin3.q5 <- rubin3(data=quin5, covlist=quin5[covs])
+
+toy.rubin3 <- data_frame(covs, All = rubin3.unadj$resid.var.ratio, 
+                         Q1 = rubin3.q1$resid.var.ratio, 
+                         Q2 = rubin3.q2$resid.var.ratio, 
+                         Q3 = rubin3.q3$resid.var.ratio, 
+                         Q4 = rubin3.q4$resid.var.ratio, 
+                         Q5 = rubin3.q5$resid.var.ratio)
+
+toy.rubin3 <- gather(toy.rubin3, "quint", "rubin3", 2:7)
+```
+
+
+```{r}
+ggplot(toy.rubin3, aes(x = rubin3, y = covs, group = quint)) + 
+    geom_point() +
+    geom_vline(xintercept = 1) +
+    geom_vline(xintercept = c(0.8, 1.25), linetype = "dashed", col = "blue") +
+    geom_vline(xintercept = c(0.5, 2), col = "red") +
+    facet_wrap(~ quint) +
+    labs(x = "Residual Variance Ratio", y = "",
+         title = "Residual Variance Ratios by PS Quintile",
+         subtitle = "Rubin's Rule 3: The toy example")
+```
+
+Most of the residual variance ratios are in the range of (0.5, 2) in quintiles 2-5, with the exception of the `covF.high` indicator in Quintile 2. Quintile 1 is certainly problematic in this regard.
+
+# Task 7. After subclassifying, what is the estimated average treatment effect?
+
+## ... on Outcome 1 [a continuous outcome]
+
+First, we'll find the estimated average causal effect (and standard error) within each quintile via linear regression.
+
+```{r}
+quin1.out1 <- lm(out1.cost ~ treated, data=quin1)
+quin2.out1 <- lm(out1.cost ~ treated, data=quin2)
+quin3.out1 <- lm(out1.cost ~ treated, data=quin3)
+quin4.out1 <- lm(out1.cost ~ treated, data=quin4)
+quin5.out1 <- lm(out1.cost ~ treated, data=quin5)
+
+coef(summary(quin1.out1)); coef(summary(quin2.out1)); coef(summary(quin3.out1)); coef(summary(quin4.out1)); coef(summary(quin5.out1))
+```
+
+Just looking at these results, it doesn't look like combining quintile 1 with the others is a good idea. I'll do it here, to show the general idea, but I'm not satisfied with the results. There is certainly a cleverer way to accomplish this using the `broom` package, or maybe a little programming with `purrr`.
+
+Next, we find the mean of the five quintile-specific estimated regression coefficients
+
+```{r}
+est.st <- (coef(quin1.out1)[2] + coef(quin2.out1)[2] + coef(quin3.out1)[2] +
+               coef(quin4.out1)[2] + coef(quin5.out1)[2])/5
+est.st
+```
+
+To get the combined standard error estimate, we do the following:
+
+```{r}
+se.q1 <- summary(quin1.out1)$coefficients[2,2]
+se.q2 <- summary(quin2.out1)$coefficients[2,2]
+se.q3 <- summary(quin3.out1)$coefficients[2,2]
+se.q4 <- summary(quin4.out1)$coefficients[2,2]
+se.q5 <- summary(quin5.out1)$coefficients[2,2]
+
+se.st <- sqrt((se.q1^2 + se.q2^2 + se.q3^2 + se.q4^2 + se.q5^2)*(1/25))
+se.st
+```
+
+The resulting 95% confidence Interval for the average causal treatment effect is then:
+
+```{r}
+strat.result1 <- data_frame(estimate = est.st,
+                            conf.low = est.st - 1.96*se.st,
+                            conf.high = est.st + 1.96*se.st)
+strat.result1
+```
+
+Again, I don't trust this estimate in this setting because the balance (especially in Quintile 1) is too weak.
+
+
+## Results So Far (After Matching and Subclassification)
+
+These subclassification results describe the average treatment effect, while the previous analyses we have completed describe the average treatment effect on the treated. This is one reason for the meaningful difference between the estimates. Another reason is that the balance on observed covariates is much worse after stratification in some quintiles, especially Quintile 1.
+
+Est. Treatment Effect (95% CI) | Outcome 1 (Cost diff.) 
+----------------: | -----------: 
+No covariate adjustment | **`r decim(res_unadj_1$estimate,2)`** 
+(unadjusted) | (`r decim(res_unadj_1$conf.low,2)`, `r decim(res_unadj_1$conf.high,2)`) 
+After 1:1 PS Match | **`r decim(match1.out1$est.noadj, 2)`** 
+(`Match`: Automated) | (`r decim(match1.out1$est.noadj - 1.96*match1.out1$se.standard, 2)`, `r decim(match1.out1$est.noadj + 1.96*match1.out1$se.standard, 2)`) | 
+After 1:1 PS Match | **`r decim(res_matched_1$estimate, 2)`** 
+("Regression" Models) | (`r decim(res_matched_1$conf.low, 2)`, `r decim(res_matched_1$conf.high, 2)`) 
+After PS Subclassification | **`r decim(strat.result1$estimate, 2)`** 
+("Regression" models, ATE) | (`r decim(strat.result1$conf.low, 2)`, `r decim(strat.result1$conf.high, 2)`) 
+
+# Task 8. Execute weighting by the inverse PS, then assess covariate balance
+
+## ATT approach: Weight treated subjects as 1; control subjects as ps/(1-ps)
+
+```{r}
+toy$wts1 <- ifelse(toy$treated==1, 1, toy$ps/(1-toy$ps))
+```
+
+Here is a plot of the resulting ATT (average treatment effect on the treated) weights:
+
+```{r}
+ggplot(toy, aes(x = ps, y = wts1, color = treated_f)) +
+    geom_point() + 
+    guides(color = FALSE) +
+    facet_wrap(~ treated_f) +
+    labs(x = "Estimated Propensity for Treatment",
+         y = "ATT weights for the toy example",
+         title = "ATT weighting structure: Toy example")
+```
+
+
+## ATE Approach: Weight treated subjects by 1/ps; Control subjects by 1/(1-PS)
+
+```{r}
+toy$wts2 <- ifelse(toy$treated==1, 1/toy$ps, 1/(1-toy$ps))
+```
+
+Here's a plot of the ATE (average treatment effect) weights...
+
+```{r}
+ggplot(toy, aes(x = ps, y = wts2, color = treated_f)) +
+    geom_point() + 
+    guides(color = FALSE) +
+    facet_wrap(~ treated_f) +
+    labs(x = "Estimated Propensity for Treatment",
+         y = "ATE weights for the toy example",
+         title = "ATE weighting structure: Toy example")
+```
+
+## Assessing Balance after Weighting
+
+The `twang` package provides several functions for assessing balance after weighting, in addition to actually doing the weighting using more complex propensity models. For this example, we'll demonstrate balance assessment for our two (relatively simple) weighting schemes. In other examples, we'll use `twang` to do more complete weighting work.
+
+### Reminder of ATT vs. ATE Definitions
+
+- Informally, the **average treatment effect on the treated** (ATT) estimate describes the difference in potential outcomes (between treated and untreated subjects) summarized across the population of people who actually received the treatment. This is usually the estimate we work with in making causal estimates from observational studies.
+- On the other hand, the **average treatment effect** (ATE) refers to the difference in potential outcomes summarized across the entire population, including those who did not receive the treatment.  
+
+
+### For ATT weights (`wts1`)
+
+```{r}
+toy_df <- data.frame(toy) # twang doesn't react well to tibbles
+
+covlist <- c("covA", "covB", "covC", "covD", "covE", "covF", "Asqr","BC", "BD", "ps", "linps")
+
+# for ATT weights
+bal.wts1 <- dx.wts(x=toy_df$wts1, data=toy_df, vars=covlist, 
+                   treat.var="treated", estimand="ATT")
+bal.wts1
+bal.table(bal.wts1)
+```
+
+The `std.eff.sz` shows the standardized difference, but as a proportion, rather than as a percentage. We'll create a data frame (tibble) so we can plot the data more easily.
+
+```{r }
+bal.before.wts1 <- bal.table(bal.wts1)[1]
+bal.after.wts1 <- bal.table(bal.wts1)[2]
+
+balance.att.weights <- data_frame(names = rownames(bal.before.wts1$unw), 
+                              pre.weighting = 100*bal.before.wts1$unw$std.eff.sz, 
+                              ATT.weighted = 100*bal.after.wts1[[1]]$std.eff.sz)
+balance.att.weights <- gather(balance.att.weights, timing, szd, 2:3)
+```
+
+OK - here is the plot of standardized differences before and after ATT weighting.
+
+```{r}
+ggplot(balance.att.weights, aes(x = szd, y = reorder(names, szd), color = timing)) +
+    geom_point() + 
+    geom_vline(xintercept = 0) +
+    geom_vline(xintercept = c(-10,10), linetype = "dashed", col = "blue") +
+    labs(x = "Standardized Difference", y = "", 
+         title = "Standardized Difference before and after ATT Weighting",
+         subtitle = "The toy example") 
+```
+
+
+### For ATE weights (`wts2`)
+
+```{r}
+bal.wts2 <- dx.wts(x=toy_df$wts2, data=toy_df, vars=covlist, 
+                   treat.var="treated", estimand="ATE")
+bal.wts2
+bal.table(bal.wts2)
+```
+
+```{r }
+bal.before.wts2 <- bal.table(bal.wts2)[1]
+bal.after.wts2 <- bal.table(bal.wts2)[2]
+
+balance.ate.weights <- data_frame(names = rownames(bal.before.wts2$unw), 
+                              pre.weighting = 100*bal.before.wts2$unw$std.eff.sz, 
+                              ATE.weighted = 100*bal.after.wts2[[1]]$std.eff.sz)
+balance.ate.weights <- gather(balance.ate.weights, timing, szd, 2:3)
+```
+
+Here is the plot of standardized differences before and after ATE weighting.
+
+```{r}
+ggplot(balance.ate.weights, aes(x = szd, y = reorder(names, szd), color = timing)) +
+    geom_point() + 
+    geom_vline(xintercept = 0) +
+    geom_vline(xintercept = c(-10,10), linetype = "dashed", col = "blue") +
+    labs(x = "Standardized Difference", y = "", 
+         title = "Standardized Difference before and after ATE Weighting",
+         subtitle = "The toy example") 
+```
+
+## Rubin's Rules after ATT weighting
+
+For our weighted sample, our summary statistic for Rules 1 and 2 may be found from the
+`bal.table` output.
+
+### Rubin's Rule 1
+
+We can read off the standardized effect size after weighting for the linear propensity
+score as -0.091. Multiplying by 100, we get 9.1%, so we would pass Rule 1.
+
+### Rubin's Rule 2
+
+We can read off the standard deviations within the treated and control groups. We can
+then square each, to get the relevant variances, then take the ratio of those variances.
+Here, we have standard deviations of the linear propensity score after weighting of 0.801 in the treated group and 0.904 in the control group. 0.801^2 / 0.904^2 = 0.7851, which is just outside our desired range of 4/5 to 5/4, as well as clearly within 1/2 to 2. Arguably, we can pass Rule 2, also. But I'll be interested to see if `twang` can do better.
+
+### Rubin's Rule 3
+
+Rubin's Rule 3 requires some more substantial manipulation of the data. I'll skip that for now.
+
+## Rubin's Rules after ATE weighting
+
+Again, our summary statistic for Rules 1 and 2 may be found from the `bal.table` output.
+
+### Rubin's Rule 1
+
+The standardized effect size after ATE weighting for the linear propensity score is 0.177. Multiplying by 100, we get 17.7%, so we would pass Rule 1.
+
+### Rubin's Rule 2
+
+We can read off the standard deviations within the treated and control groups from the ATE weights, then square to get the variances, then take the ratio. Here, we have 0.806^2 / 1.078^2 = 0.559, which is not within our desired range of 4/5 to 5/4, but is between 0.5 and 2. Arguably, we pass Rule 2, also. But I'll be interested to see if `twang` can do better.
+
+### Rubin's Rule 3
+
+Again, for now, I'm skipping Rubin's Rule 3 after weighting.
+
+# Using TWANG for Alternative PS Estimation and ATT Weighting
+
+Here, I'll demonstrate the use of the the `twang` package's functions to fit the propensity model and then perform ATT weighting, mostly using default options.
+
+## Estimate the Propensity Score using Generalized Boosted Regression, and then perfom ATT Weighting
+
+We can directly use the `twang` (**t**oolkit for **w**eighting and **a**nalysis of **n**onequivalent **g**roups) package to weight our results, and even to re-estimate the propensity score using generalized boosted regression rather than a logistic regression model. The `twang` vignette is very helpful and found at [this link](https://cran.r-project.org/web/packages/twang/vignettes/twang.pdf).
+
+To begin, we'll estimate the propensity score using the `twang` function `ps`. This uses a *generalized boosted regression* approach to estimate the propensity score and produce material for checking balance.
+
+```{r, warning = FALSE}
+# Recall that twang does not play well with tibbles,
+# so we have to use the data frame version of the toy object
+
+ps.toy <- ps(treated ~ covA + covB + covC + covD + covE + covF + 
+                 Asqr + BC + BD,
+             data = toy_df,
+             n.trees = 3000,
+             interaction.depth = 2,
+             stop.method = c("es.mean"),
+             estimand = "ATT",
+             verbose = FALSE)
+```
+
+### Did we let the simulations run long enough to stabilize estimates?
+
+```{r}
+plot(ps.toy)
+```
+
+### What is the effective sample size of our weighted results?
+
+```{r}
+summary(ps.toy)
+```
+
+### How is the balance?
+
+```{r}
+plot(ps.toy, plots = 2)
+```
+
+```{r}
+plot(ps.toy, plots = 3)
+```
+
+### Assessing Balance with `cobalt`
+
+```{r}
+bal.tab(ps.toy, full.stop.method = "es.mean.att")
+```
+
+## Semi-Automated Love plot of Standardized Differences
+
+```{r}
+p <- love.plot(bal.tab(ps.toy), 
+               threshold = .1, size = 1.5, 
+               title = "Standardized Diffs and TWANG ATT weighting")
+p + theme_bw()
+```
+
+## Semi-Automated Love plot of Variance Ratios
+
+```{r}
+p <- love.plot(bal.tab(ps.toy), stat = "v",
+               threshold = 1.25, size = 1.5, 
+               title = "Variance Ratios: TWANG ATT weighting")
+p + theme_bw()
+```
+
+# Task 9. After weighting, what is the estimated average causal effect of treatment?
+
+## ... on Outcome 1 [a continuous outcome]
+
+### with ATT weights
+
+The relevant regression approach uses the `svydesign` and `svyglm` functions from the `survey` package.
+
+```{r}
+toywt1.design <- svydesign(ids=~1, weights=~wts1, data=toy) # using ATT weights
+
+adjout1.wt1 <- svyglm(out1.cost ~ treated, design=toywt1.design)
+
+wt_att_results1 <- tidy(adjout1.wt1, conf.int = TRUE) %>% filter(term == "treated")
+```
+
+### with ATE weights
+
+```{r}
+toywt2.design <- svydesign(ids=~1, weights=~wts2, data=toy) # using ATE weights
+
+adjout1.wt2 <- svyglm(out1.cost ~ treated, design=toywt2.design)
+wt_ate_results1 <- tidy(adjout1.wt2, conf.int = TRUE) %>% filter(term == "treated")
+```
+
+### with TWANG ATT weights
+
+```{r}
+toywt3.design <- svydesign(ids=~1, 
+                           weights=~get.weights(ps.toy, 
+                                                stop.method = "es.mean"),
+                           data=toy) # using twang ATT weights
+
+adjout1.wt3 <- svyglm(out1.cost ~ treated, design=toywt3.design)
+wt_twangatt_results1 <- tidy(adjout1.wt3, conf.int = TRUE) %>% filter(term == "treated")
+```
+
+
+
+## Results So Far (After Matching, Subclassification and Weighting)
+
+Est. Treatment Effect (95% CI) | Outcome 1 (Cost diff.) 
+----------------: | -----------: | -----------: 
+No covariate adjustment | **`r decim(res_unadj_1$estimate,2)`** 
+(unadjusted) | (`r decim(res_unadj_1$conf.low,2)`, `r decim(res_unadj_1$conf.high,2)`) 
+After 1:1 PS Match | **`r decim(match1.out1$est.noadj, 2)`** 
+(`Match`: Automated) | (`r decim(match1.out1$est.noadj - 1.96*match1.out1$se.standard, 2)`, `r decim(match1.out1$est.noadj + 1.96*match1.out1$se.standard, 2)`) | 
+After 1:1 PS Match | **`r decim(res_matched_1$estimate, 2)`** 
+("Regression" Models) | (`r decim(res_matched_1$conf.low, 2)`, `r decim(res_matched_1$conf.high, 2)`) 
+After PS Subclassification | **`r decim(strat.result1$estimate, 2)`**
+("Regression" models, ATE) | (`r decim(strat.result1$conf.low, 2)`, `r decim(strat.result1$conf.high, 2)`)
+ATT Weighting | **`r decim(wt_att_results1$estimate, 2)`** 
+ATE Weighting | **`r decim(wt_ate_results1$estimate, 2)`** 
+`twang` ATT weights | **`r decim(wt_twangatt_results1$estimate, 2)`** 
+(ATT) | (`r decim(wt_twangatt_results1$conf.low, 2)`, `r decim(wt_twangatt_results1$conf.high, 2)`)
+# Task 10. After direct adjustment for the linear PS, what is the estimated average  causal treatment effect?
+
+## ... on Outcome 1 [a continuous outcome]
+
+Here, we fit a linear regression model with `linps` added as a covariate.
+
+```{r}
+adj.reg.out1 <- lm(out1.cost ~ treated + linps, data=toy)
+
+adj_out1 <- tidy(adj.reg.out1, conf.int = TRUE) %>% filter(term == "treated")
+```
+
+
+
+## Results So Far (After Matching, Subclassification, Weighting, Adjustment)
+
+Est. Treatment Effect (95% CI) | Outcome 1 (Cost diff.) 
+----------------: | -----------: 
+No covariate adjustment | **`r decim(res_unadj_1$estimate,2)`** 
+(unadjusted) | (`r decim(res_unadj_1$conf.low,2)`, `r decim(res_unadj_1$conf.high,2)`) 
+After 1:1 PS Match | **`r decim(match1.out1$est.noadj, 2)`** 
+(`Match`: Automated) | (`r decim(match1.out1$est.noadj - 1.96*match1.out1$se.standard, 2)`, `r decim(match1.out1$est.noadj + 1.96*match1.out1$se.standard, 2)`) 
+After 1:1 PS Match | **`r decim(res_matched_1$estimate, 2)`** 
+("Regression" Models) | (`r decim(res_matched_1$conf.low, 2)`, `r decim(res_matched_1$conf.high, 2)`) 
+After PS Subclassification | **`r decim(strat.result1$estimate, 2)`** 
+("Regression" models, ATE) | (`r decim(strat.result1$conf.low, 2)`, `r decim(strat.result1$conf.high, 2)`) 
+ATT Weighting | **`r decim(wt_att_results1$estimate, 2)`** 
+(ATT) | (`r decim(wt_att_results1$conf.low, 2)`, `r decim(wt_att_results1$conf.high, 2)`) 
+ATE Weighting | **`r decim(wt_ate_results1$estimate, 2)`**
+(ATE) | (`r decim(wt_ate_results1$conf.low, 2)`, `r decim(wt_ate_results1$conf.high, 2)`) 
+`twang` ATT weights | **`r decim(wt_twangatt_results1$estimate, 2)`** 
+(ATT) | (`r decim(wt_twangatt_results1$conf.low, 2)`, `r decim(wt_twangatt_results1$conf.high, 2)`) 
+Direct Adjustment | **`r decim(adj_out1$estimate, 2)`** 
+(with `linps`, ATT) | (`r decim(adj_out1$conf.low, 2)`, `r decim(adj_out1$conf.high, 2)`) 
+
+# Task 11. "Double Robust" Approach - Weighting + Adjustment, what is the estimated average causal effect of treatment?
+
+This approach is essentially identical to the weighting analyses done in Task 9. The only change is to add `linps` to `treated` in the outcome models.
+
+## ... on Outcome 1 [a continuous outcome]
+
+### with ATT weights
+
+The relevant regression approach uses the `svydesign` and `svyglm` functions from the `survey` package.
+
+```{r}
+toywt1.design <- svydesign(ids=~1, weights=~wts1, data=toy) # using ATT weights
+
+dr.out1.wt1 <- svyglm(out1.cost ~ treated + linps, design=toywt1.design)
+
+dr_att_out1 <- tidy(dr.out1.wt1, conf.int = TRUE) %>% filter(term == "treated")
+dr_att_out1
+```
+
+### with ATE weights
+
+```{r}
+toywt2.design <- svydesign(ids=~1, weights=~wts2, data=toy) # using ATE weights
+
+dr.out1.wt2 <- svyglm(out1.cost ~ treated + linps, design=toywt2.design)
+
+dr_ate_out1 <- tidy(dr.out1.wt2, conf.int = TRUE) %>% filter(term == "treated")
+dr_ate_out1
+```
+
+### with `twang` based ATT weights
+
+```{r}
+wts3 <- get.weights(ps.toy, stop.method = "es.mean")
+
+toywt3.design <- svydesign(ids=~1, weights=~wts3, data=toy) # twang ATT weights
+
+dr.out1.wt3 <- svyglm(out1.cost ~ treated + linps, design=toywt3.design)
+
+dr_twangatt_out1 <- tidy(dr.out1.wt3, conf.int = TRUE) %>% filter(term == "treated")
+dr_twangatt_out1
+```
+
+
+
+# Task 12. Results
+
+## Treatment Effect Estimates
+
+We now can build the table of all of the outcome results we've obtained here.
+
+Est. Treatment Effect (95% CI) | Outcome 1 (Cost diff.) 
+----------------: | -----------: 
+No covariate adjustment | **`r decim(res_unadj_1$estimate,2)`** 
+(unadjusted) | (`r decim(res_unadj_1$conf.low,2)`, `r decim(res_unadj_1$conf.high,2)`) 
+After 1:1 PS Match | **`r decim(match1.out1$est.noadj, 2)`** 
+(`Match`: Automated) | (`r decim(match1.out1$est.noadj - 1.96*match1.out1$se.standard, 2)`, `r decim(match1.out1$est.noadj + 1.96*match1.out1$se.standard, 2)`) 
+After 1:1 PS Match | **`r decim(res_matched_1$estimate, 2)`** 
+("Regression" Models) | (`r decim(res_matched_1$conf.low, 2)`, `r decim(res_matched_1$conf.high, 2)`) 
+After PS Subclassification | **`r decim(strat.result1$estimate, 2)`** 
+("Regression" models, ATE) | (`r decim(strat.result1$conf.low, 2)`, `r decim(strat.result1$conf.high, 2)`) 
+ATT Weighting | **`r decim(wt_att_results1$estimate, 2)`** 
+(ATT) | (`r decim(wt_att_results1$conf.low, 2)`, `r decim(wt_att_results1$conf.high, 2)`) 
+ATE Weighting | **`r decim(wt_ate_results1$estimate, 2)`** 
+(ATE) | (`r decim(wt_ate_results1$conf.low, 2)`, `r decim(wt_ate_results1$conf.high, 2)`) 
+`twang` ATT weights | **`r decim(wt_twangatt_results1$estimate, 2)`** 
+(ATT) | (`r decim(wt_twangatt_results1$conf.low, 2)`, `r decim(wt_twangatt_results1$conf.high, 2)`) 
+Direct Adjustment | **`r decim(adj_out1$estimate, 2)`** 
+(with `linps`, ATT) | (`r decim(adj_out1$conf.low, 2)`, `r decim(adj_out1$conf.high, 2)`) 
+Double Robust     | **`r decim(dr_att_out1$estimate, 2)`** 
+(ATT wts + adj.)  | (`r decim(dr_att_out1$conf.low, 2)`, `r decim(dr_att_out1$conf.high, 2)`) 
+Double Robust     | **`r decim(dr_ate_out1$estimate, 2)`** 
+(ATE wts + adj.)  | (`r decim(dr_ate_out1$conf.low, 2)`, `r decim(dr_ate_out1$conf.high, 2)`) 
+Double Robust     | **`r decim(dr_twangatt_out1$estimate, 2)`** 
+(`twang` ATT wts + adj.)  | (`r decim(dr_twangatt_out1$conf.low, 2)`, `r decim(dr_twangatt_out1$conf.high, 2)`) 
+
+So, with the exception of the subclassification approach (which was problematic in terms of observed covariate balance) we observe significant results (indicating higher costs with the treatment, and higher likelihood of experiencing the event, and increased hazard of event occurrence) for every adjustment approach.
